@@ -1,0 +1,402 @@
+library(kernlab)
+library(drf)
+library(Matrix)
+library(dplyr)
+library(doParallel)
+library(doRNG)
+library(parallel)
+library(ggplot2)
+library(dplyr)
+library(ggpubr)
+library(drf)
+library(ggplot2)
+library(fastDummies)
+library(Hmisc)
+
+source("CIdrf.R")
+load("wage_data.Rdata")
+
+
+set.seed(2)
+
+
+which = rep(TRUE, nrow(wage))
+which = which & (wage$age >= 17)
+which = which & (wage$weeks_worked > 48)
+which = which & (wage$hours_worked > 16)
+which = which & (wage$employment_status == 'employed')
+which = which & (wage$employer != 'self-employed')
+which[is.na(which)] = FALSE
+
+data = wage[which, ]
+sum(is.na(data))
+colSums(is.na(data))
+rownames(data) = 1:nrow(data)
+#data = na.omit(data)
+
+data$log_wage = log(data$salary / (data$weeks_worked * data$hours_worked))
+
+
+## Prepare data and fit drf
+
+X = data[,c(
+  'age',
+  'race',
+  'hispanic_origin',
+  'citizenship',
+  'nativity',
+  
+  'marital',
+  'family_size',
+  'children',
+  
+  'education_level',
+  'english_level',
+  
+  'economic_region'
+)]
+X$occupation = unlist(lapply(as.character(data$occupation), function(s){return(substr(s, 1, 2))}))
+X$occupation = as.factor(X$occupation)
+X$industry = unlist(lapply(as.character(data$industry), function(s){return(substr(s, 1, 2))}))
+X$industry[X$industry %in% c('32', '33', '3M')] = '31'
+X$industry[X$industry %in% c('42')] = '41'
+X$industry[X$industry %in% c('45', '4M')] = '44'
+X$industry[X$industry %in% c('49')] = '48'
+X$industry[X$industry %in% c('92')] = '91'
+X$industry = as.factor(X$industry)
+X=dummy_cols(X, remove_selected_columns=TRUE)
+X = as.matrix(X)
+
+Y = data[,c('sex', 'log_wage')]
+Y$sex = (Y$sex == 'male')
+Y = as.matrix(Y)
+
+
+train_idx = sample(1:nrow(data), 4000, replace=FALSE)
+
+## Focus on training data
+Ytrain=Y[train_idx,]
+Xtrain=X[train_idx,]
+
+
+
+## Plot the test data without adjustment
+plotdfunadj = data[train_idx, ]
+plotdfunadj$weight=1
+plotdfunadj$plotweight[plotdfunadj$sex=='female'] = plotdfunadj$weight[plotdfunadj$sex=='female']/sum(plotdfunadj$weight[plotdfunadj$sex=='female'])
+plotdfunadj$plotweight[plotdfunadj$sex=='male'] = plotdfunadj$weight[plotdfunadj$sex=='male']/sum(plotdfunadj$weight[plotdfunadj$sex=='male'])
+
+#pooled data
+ggplot(plotdfunadj, aes(log_wage)) +
+  geom_density(adjust=2.5, alpha = 0.3, show.legend=TRUE,  aes(fill=sex, weight=plotweight)) +
+  #coord_cartesian(xlim=c(0.7, 5.8)) +
+  theme_light()+
+  scale_fill_discrete(name = "gender", labels = c('female', "male"))+
+  theme(legend.position = c(0.83, 0.66),
+        legend.text=element_text(size=18),
+        legend.title=element_text(size=20),
+        legend.background = element_rect(fill=alpha('white', 0.5)),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14),
+        axis.title.x = element_text(size=19),
+        axis.title.y = element_text(size=19))+
+  labs(x='log(hourly_wage)')
+#ggsave('~/Documents/projects/heterogeneity/paper/wage_data/observational.png', width=16, height=11, units='cm')
+
+
+
+
+
+# ## Difference before adjustment!
+# 
+quantile_maleunadj = wtd.quantile(x=plotdfunadj$log_wage, weights=plotdfunadj$plotweight*(plotdfunadj$sex=='male'), normwt=TRUE, probs=0.5)
+quantile_femaleunadj = wtd.quantile(x=plotdfunadj$log_wage, weights=plotdfunadj$plotweight*(plotdfunadj$sex=='female'), normwt=TRUE, probs=0.5)
+(1-exp(quantile_femaleunadj)/exp(quantile_maleunadj))
+
+
+
+
+
+
+
+
+
+## Fit the new DRF framework
+drf_fit <- drfCI(X=Xtrain, Y=Ytrain, min.node.size = 20, splitting.rule='FourierMMD', num.features=10, B=100)
+
+
+
+
+## Step 0: Choosing x
+
+point_description = function(test_point){
+  out = ''
+  
+  out = paste(out, 'job: ', test_point$occupation_description[1], sep='')
+  out = paste(out, '\nindustry: ', test_point$industry_description[1], sep='')
+  
+  out = paste(out, '\neducation: ', test_point$education[1], sep='')
+  out = paste(out, '\nemployer: ', test_point$employer[1], sep='')
+  out = paste(out, '\nregion: ', test_point$economic_region[1], sep='')
+  
+  out = paste(out, '\nmarital: ', test_point$marital[1], sep='')
+  out = paste(out, '\nfamily_size: ', test_point$family_size[1], sep='')
+  out = paste(out, '\nchildren: ', test_point$children[1], sep='')
+  
+  out = paste(out, '\nnativity: ', test_point$nativity[1], sep='')
+  out = paste(out, '\nhispanic: ', test_point$hispanic_origin[1], sep='')
+  out = paste(out, '\nrace: ', test_point$race[1], sep='')
+  out = paste(out, '\nage: ', test_point$age[1], sep='')
+  
+  return(out)
+}
+
+
+
+# Choosing a test point that is not in the training set for the given seed
+#i=sample((1:nrow(X))[-train_idx], 1)
+i<-47
+
+# Important: Test point needs to be a matrix
+x<-X[i,, drop=F]
+
+# predict with the new framework
+DRF = predictdrf(drf_fit, x=x)
+weights <- DRF$weights
+
+
+## Do first data plotting
+
+plotdfx = data[train_idx, ]
+
+print(data[i,])
+
+propensity = sum(weights[plotdfx$sex=='female'])
+plotdfx$plotweight = 0
+plotdfx$plotweight[plotdfx$sex=='female'] = weights[plotdfx$sex=='female']/propensity
+plotdfx$plotweight[plotdfx$sex=='male'] = weights[plotdfx$sex=='male']/(1-propensity)
+
+
+gg = ggplot(plotdfx, aes(log_wage)) +
+  geom_density(adjust=5, alpha = 0.3, show.legend=TRUE,  aes(fill=sex, weight=plotweight)) +
+  #coord_cartesian(xlim=c(0.3, 6)) +
+  labs(x='log(hourly wage)')+
+  #ggtitle(sprintf('%g', i)) +
+  #theme(plot.title = element_text(size = 10, face = "italic")) +
+  theme_light()+
+  scale_fill_discrete(name = "gender", labels = c(sprintf("F: %g%%", round(100*propensity, 1)), sprintf("M: %g%%", round(100*(1-propensity), 1))))+
+  theme(legend.position = c(0.9, 0.65),
+        legend.text=element_text(size=18),
+        legend.title=element_text(size=20),
+        legend.background = element_rect(fill=alpha('white', 0)),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14),
+        axis.title.x = element_text(size=19),
+        axis.title.y = element_text(size=19))+
+  annotate("text", x=-1, y=Inf, hjust=0, vjust=1, size=5, label = point_description(data[i,]))
+plot(gg)
+
+
+## Getting the respective weights
+weightsmale<-weights*(Ytrain[, "sex"]==1)/sum(weights*(Ytrain[, "sex"]==1))
+weightsfemale<-weights*(Ytrain[, "sex"]==0)/sum(weights*(Ytrain[, "sex"]==0))
+
+
+## Choosing alpha:
+alpha<-0.05
+
+
+# Step 1: Doing Median comparison for fixed x
+
+quantile_male = wtd.quantile(x=data$log_wage[train_idx], weights=matrix(weightsmale), normwt=TRUE, probs=0.5)
+quantile_female = wtd.quantile(x=data$log_wage[train_idx], weights=matrix(weightsfemale), normwt=TRUE, probs=0.5)
+
+(medianx<-unname(1-exp(quantile_female)/exp(quantile_male)))
+
+
+mediandist <- sapply(DRF$weightsb, function(wb) {
+  
+  wbmale<-wb*(Ytrain[, "sex"]==1)/sum(wb*(Ytrain[, "sex"]==1))
+  wbfemale<-wb*(Ytrain[, "sex"]==0)/sum(wb*(Ytrain[, "sex"]==0))
+  
+  
+  quantile_maleb = wtd.quantile(x=data$log_wage[train_idx], weights=matrix(wbmale), normwt=TRUE, probs=0.5)
+  quantile_femaleb = wtd.quantile(x=data$log_wage[train_idx], weights=matrix(wbfemale), normwt=TRUE, probs=0.5)
+  
+  
+  return( unname(1-exp(quantile_femaleb)/exp(quantile_maleb)) ) 
+})
+
+varx<-var(mediandist)
+
+## Use Gaussian CI:
+(upper<-medianx + qnorm(1-alpha/2)*sqrt(varx))
+(lower<-medianx - qnorm(1-alpha/2)*sqrt(varx))
+
+
+
+
+
+# Step 2: Comparing Witness function with confidence bands!
+
+
+
+Witobj<-Witdrf(drf_fit, x=x, groupingvar="sex",alpha=0.05)
+
+
+
+hatmun<-function(y,Witobj){
+  
+  c<-Witobj$c
+  k_Y<-Witobj$k_Y
+  Y<-Witobj$Y
+  weightsall1<-Witobj$weightsall1
+  weightsall0<-Witobj$weightsall0
+  Ky=t(kernelMatrix(k_Y, Y , y = y))
+  
+  #K1y <- t(kernelMatrix(k_Y, DRF$Y[DRF$Y[, groupingvar]==1,coln[coln!=groupingvar]], y = y))
+  #K0y <- t(kernelMatrix(k_Y, DRF$Y[DRF$Y[, groupingvar]==0,coln[coln!=groupingvar]], y = y))
+  out<-list()
+  out$val <- tcrossprod(Ky, weightsall1  ) - tcrossprod(Ky, weightsall0  )
+  out$upper<-  out$val+sqrt(c)
+  out$lower<-  out$val-sqrt(c)
+  
+  return( out )
+  
+  
+  
+}
+
+all<-hatmun(sort(Witobj$Y),Witobj)
+
+
+plot(sort(Witobj$Y),all$val , type="l", col="darkblue", lwd=2, ylim=c(min(all$lower), max(all$upper)),
+     xlab="log(wage)", ylab="witness function")
+lines(sort(Witobj$Y),all$upper , type="l", col="darkgreen", lwd=2 )
+lines(sort(Witobj$Y),all$lower , type="l", col="darkgreen", lwd=2 )
+abline(h=0)
+
+
+
+# Step 3: Estimating Counterfactual distribution.
+
+
+## Get a test set, for which we evaluate several predictions
+test_idx = sample(setdiff(1:nrow(data), train_idx), 1999, replace=FALSE)
+
+## Add point Id=47 to the test set
+test_idx<-c(test_idx,47)
+
+Ytest=Y[test_idx,]
+Xtest=X[test_idx,]
+
+
+
+#### Something is wrong here!! We get exactly the same!!
+
+## Male is 1, Female is 0
+
+# obtain all X from the female test population
+Xtestf<-Xtest[Ytest[,"sex"]==0,]
+
+
+# Obtain the conditional distribution of W | G=male, X=x, for x in the female
+# population
+# These weights correspond to P(W, G=male | X=x  )
+weightsf<-predictdrf(drf_fit, x=Xtestf)$weights*(Ytrain[, "sex"]==1)
+
+# These weights correspond to P(W | G=male, X=x  )
+weightsfnorm<-weightsf/rowSums(weightsf)
+
+# The counterfactual distribution is the average over those weights/distributions 
+counterfactualw<-colMeans(weightsfnorm)
+
+
+
+##### continue here coding correctly!!
+
+plotdfc = data[train_idx, ]
+plotdfc$plotweight = counterfactualw
+
+
+# propensity = sum(counterfactualw[plotdfc$sex=='female'])
+# plotdfc$plotweight = 0
+# plotdfc$plotweight[plotdfc$sex=='female'] = counterfactualw[plotdfc$sex=='female']/propensity
+# plotdfc$plotweight[plotdfc$sex=='male'] = counterfactualw[plotdfc$sex=='male']/(1-propensity) #plotdfunadj$plotweight[plotdfunadj$sex=='male']
+#   #counterfactualw[plotdfc$sex=='male']/(1-propensity)
+# 
+
+plotdfc<-rbind(plotdfc, plotdfunadj[plotdfunadj$sex=='female',])
+plotdfc$sex2<-c(rep(1, length(train_idx)), rep(0,nrow(plotdfunadj[plotdfunadj$sex=='female',])))
+
+plotdfc$sex2<-factor(plotdfc$sex2)
+
+
+#interventional distribution
+ggplot(plotdfc, aes(log_wage)) +
+  geom_density(adjust=2.5, alpha = 0.3, show.legend=TRUE,  aes(fill=sex2, weight=plotweight)) +
+  #coord_cartesian(xlim=c(0.7, 5.8), ylim=c(0,0.7)) +
+  theme_light()+
+  scale_fill_discrete(name = "", labels = c("observed women's wages", "wages if treated as men"))+
+  theme(legend.position = c(0.2, 0.98),
+        legend.text=element_text(size=16),
+        legend.title=element_text(size=20),
+        legend.background = element_rect(fill=alpha('white', 0)),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14),
+        axis.title.x = element_text(size=19),
+        axis.title.y = element_text(size=19))+
+  labs(x='log(hourly wage)')
+
+
+quantile_male = wtd.quantile(x=plotdfc$log_wage[plotdfc$sex2==1], weights=counterfactualw, normwt=TRUE, probs=0.5)
+quantile_female = wtd.quantile(x=plotdfunadj$log_wage, weights=plotdfunadj$plotweight*(plotdfunadj$sex=='female'), normwt=TRUE, probs=0.5)
+(1-exp(quantile_female)/exp(quantile_male))
+
+
+#### From DRF ####
+
+
+plotdf = data[train_idx, ]
+plotdf$plotweight = 0
+cnt=0
+
+which = (1:nrow(Xtest))
+which = which[Ytest[,"sex"]==0]
+set.seed(22)
+
+N<-nrow(Xtest)
+
+for(i in 1:nrow(weightsf)){
+  print(cnt)
+  cnt = cnt+1
+  #print(data[i,])
+  
+  weights<-weightsf[i,]
+   
+  propensity = sum(weights[plotdf$sex=='female'])
+  plotdf$plotweight[plotdf$sex=='female'] = plotdf$plotweight[plotdf$sex=='female'] + weights[plotdf$sex=='female']/propensity/N
+  plotdf$plotweight[plotdf$sex=='male'] = plotdf$plotweight[plotdf$sex=='male'] + weights[plotdf$sex=='male']/(1-propensity)/N
+}
+
+
+#interventional distribution
+ggplot(plotdf, aes(log_wage)) +
+  geom_density(adjust=2.5, alpha = 0.3, show.legend=TRUE,  aes(fill=sex, weight=plotweight)) +
+  coord_cartesian(xlim=c(0.7, 5.8), ylim=c(0,0.7)) +
+  theme_light()+
+  scale_fill_discrete(name = "", labels = c("observed women's wages", "wages if treated as men"))+
+  theme(legend.position = c(0.59, 0.98),
+        legend.text=element_text(size=16),
+        legend.title=element_text(size=20),
+        legend.background = element_rect(fill=alpha('white', 0)),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14),
+        axis.title.x = element_text(size=19),
+        axis.title.y = element_text(size=19))+
+  labs(x='log(hourly wage)')
+
+
+quantile_male = wtd.quantile(x=plotdf$log_wage, weights=plotdf$plotweight*(plotdf$sex=='male'), normwt=TRUE, probs=0.5)
+quantile_female = wtd.quantile(x=plotdf$log_wage, weights=plotdf$plotweight*(plotdf$sex=='female'), normwt=TRUE, probs=0.5)
+(1-exp(quantile_female)/exp(quantile_male))
