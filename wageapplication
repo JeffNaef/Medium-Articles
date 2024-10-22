@@ -13,7 +13,7 @@ library(ggplot2)
 library(fastDummies)
 library(Hmisc)
 
-source("CIdrf.R")
+source("CIdrf.R") ###Function at the end of the file
 load("wage_data.Rdata")
 
 
@@ -395,6 +395,137 @@ ggplot(plotdf, aes(log_wage)) +
         axis.title.x = element_text(size=19),
         axis.title.y = element_text(size=19))+
   labs(x='log(hourly wage)')
+
+
+
+## Functions in CIdrf.R that is loaded above ##
+
+drfCI <- function(X, Y, B, sampling = "binomial",...) {
+
+### Function that uses DRF with subsampling to obtain confidence regions as
+### as described in https://arxiv.org/pdf/2302.05761.pdf
+### X: Matrix of predictors
+### Y: Matrix of variables of interest
+### B: Number of half-samples/mini-forests
+
+  n <- dim(X)[1]
+  
+  # compute point estimator and DRF per halfsample S
+  # weightsb: B times n matrix of weights
+  DRFlist <- lapply(seq_len(B), function(b) {
+    
+    # half-sample index
+    indexb <- if (sampling == "binomial") {
+      seq_len(n)[as.logical(rbinom(n, size = 1, prob = 0.5))]
+    } else {
+      sample(seq_len(n), floor(n / 2), replace = FALSE)
+    }
+    
+    ## Using refitting DRF on S
+    DRFb <- 
+      drf(X = X[indexb, , drop = F], Y = Y[indexb, , drop = F],
+          ci.group.size = 1, ...)
+    
+    
+    return(list(DRF = DRFb, indices = indexb))
+  })
+  
+  return(list(DRFlist = DRFlist, X = X, Y = Y) )
+}
+
+predictdrf<- function(DRF, x, ...) {
+
+### Function to predict from DRF with Confidence Bands
+### DRF: DRF object
+### x: Testpoint
+  
+  ntest <- nrow(x)
+  n <- nrow(DRF$Y)
+  
+  ## extract the weights w^S(x)
+  weightsb <- lapply(DRF$DRFlist, function(l) {
+    
+    weightsbfinal <- Matrix(0, nrow = ntest, ncol = n , sparse = TRUE)
+    
+    weightsbfinal[, l$indices] <- predict(l$DRF, x)$weights 
+    
+    return(weightsbfinal)
+  })
+  
+  
+  ## obtain the overall weights w
+  weights<- Reduce("+", weightsb) / length(weightsb)
+  
+    
+return(list(weights = weights, weightsb = weightsb ))
+}
+
+Witdrf<- function(DRF, x, groupingvar, alpha=0.05, ...){
+  
+### Function to calculate the conditional witness function with
+### confidence bands from DRF
+### DRF: DRF object
+### x: Testpoint
+  
+  if (is.null(dim(x)) ){
+    
+  stop("x needs to have dim(x) > 0")
+  }
+  
+  ntest <- nrow(x)
+  n <- nrow(DRF$Y)
+  coln<-colnames(DRF$Y)
+  
+  
+  ## Collect w^S
+  weightsb <- lapply(DRF$DRFlist, function(l) {
+    
+    weightsbfinal <- Matrix(0, nrow = ntest, ncol = n , sparse = TRUE)
+    
+    weightsbfinal[, l$indices] <- predict(l$DRF, x)$weights 
+    
+    return(weightsbfinal)
+  })
+  
+  ## Obtain w
+  weightsall <- Reduce("+", weightsb) / length(weightsb)
+  
+  #weightsall0<-weightsall[, DRF$Y[, groupingvar]==0, drop=F]
+  #weightsall1<-weightsall[,DRF$Y[, groupingvar]==1, drop=F]
+  
+  
+  # Get the weights of the respective classes (need to standardize by propensity!)
+  weightsall0<-weightsall*(DRF$Y[, groupingvar]==0)/sum(weightsall*(DRF$Y[, groupingvar]==0))
+  weightsall1<-weightsall*(DRF$Y[, groupingvar]==1)/sum(weightsall*(DRF$Y[, groupingvar]==1))
+  
+  
+  bandwidth_Y <- drf:::medianHeuristic(DRF$Y)
+  k_Y <- rbfdot(sigma = bandwidth_Y)
+
+  K<-kernelMatrix(k_Y, DRF$Y[,coln[coln!=groupingvar]], y = DRF$Y[,coln[coln!=groupingvar]])
+
+  
+  nulldist <- sapply(weightsb, function(wb){
+    # iterate over class 1
+
+    wb0<-wb*(DRF$Y[, groupingvar]==0)/sum(wb*(DRF$Y[, groupingvar]==0))
+    wb1<-wb*(DRF$Y[, groupingvar]==1)/sum(wb*(DRF$Y[, groupingvar]==1))
+    
+    
+    diag( ( wb0-weightsall0 - (wb1-weightsall1) )%*%K%*%t( wb0-weightsall0 - (wb1-weightsall1) )  )
+    
+    
+  })
+  
+  # Choose the right quantile
+  c<-quantile(nulldist, 1-alpha)
+
+  
+  return(list(c=c, k_Y=k_Y, Y=DRF$Y[,coln[coln!=groupingvar]], nulldist=nulldist, weightsall0=weightsall0, weightsall1=weightsall1))
+  
+  
+  
+}
 
 
 quantile_male = wtd.quantile(x=plotdf$log_wage, weights=plotdf$plotweight*(plotdf$sex=='male'), normwt=TRUE, probs=0.5)
